@@ -1,0 +1,192 @@
+# Build an UNSIGNED iPhone/iPad .ipa of Generals Zero Hour on GitHub's free macOS runner.
+# No Mac needed: run it from the Actions tab, download the artifacts, sideload with
+# Sideloadly (Windows), then copy your own game files into the app's Documents folder.
+#
+# Output artifacts:
+#   GeneralsZH-ipa     -> GeneralsZH.ipa         (install with Sideloadly)
+#   GeneralsZH-extras  -> fonts/ + dxvk.conf     (copy next to your game files)
+#
+# No game assets are built into the app (the engine falls back to the app's
+# Documents folder, which is reachable via the Files app / Apple Devices on Windows).
+
+name: Build iOS IPA (unsigned)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 340
+
+    env:
+      VK_VERSION: "1.4.341.1"
+      VK_SHA256: "632cbe96c8ed6ed00c6ce25e3a7738c466134f76586e1c51f1419410d7f9042e"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Init DXVK submodule (iOS DXVK is built from it)
+        run: git submodule update --init --recursive references/fbraz3-dxvk
+
+      - name: Show Xcode / iOS SDK
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install build tools (Homebrew)
+        run: |
+          brew install ninja meson pkgconf glslang xcodegen nasm \
+                       autoconf autoconf-archive automake libtool || true
+          for t in cmake ninja meson pkg-config glslangValidator xcodegen; do
+            command -v "$t" >/dev/null || { echo "MISSING TOOL: $t"; exit 1; }
+          done
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+
+      - name: Install LunarG Vulkan SDK (with iOS component)
+        run: |
+          set -euo pipefail
+          ZIP=/tmp/vulkansdk.zip
+          curl -fL --retry 3 -o "$ZIP" \
+            "https://sdk.lunarg.com/sdk/download/${VK_VERSION}/mac/vulkansdk-macos-${VK_VERSION}.zip"
+          echo "${VK_SHA256}  ${ZIP}" | shasum -a 256 -c -
+          mkdir -p /tmp/vk && unzip -q -o "$ZIP" -d /tmp/vk
+          APP=$(find /tmp/vk -maxdepth 2 -name "*.app" -type d | head -1)
+          INSTALLER=$(find "$APP/Contents/MacOS" -type f -name "vulkansdk-macOS-*" | head -1)
+          ROOT="$HOME/VulkanSDK/${VK_VERSION}"
+          if ! "$INSTALLER" --root "$ROOT" --accept-licenses --default-answer \
+                 --confirm-command install com.lunarg.vulkan.ios; then
+            echo "iOS component install failed, retrying with defaults"
+            rm -rf "$ROOT"
+            "$INSTALLER" --root "$ROOT" --accept-licenses --default-answer \
+                 --confirm-command install
+          fi
+          echo "VULKAN_SDK=$ROOT/macOS" >> "$GITHUB_ENV"
+          echo "VK_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Fetch MoltenVK (iOS) and fonts
+        run: |
+          ./scripts/build/ios/fetch-moltenvk.sh
+          ./scripts/build/ios/stage-fonts.sh
+
+      - name: Locate iOS MoltenVK static library
+        run: |
+          set -euo pipefail
+          MVK_A="$VULKAN_SDK/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+          if [[ ! -f "$MVK_A" ]]; then
+            MVK_A=$(find "$VK_ROOT" "$HOME/GeneralsX/MoltenVK" -path '*ios-arm64/libMoltenVK.a' 2>/dev/null | head -1 || true)
+          fi
+          [[ -n "$MVK_A" && -f "$MVK_A" ]] || { echo "ERROR: iOS libMoltenVK.a not found"; exit 1; }
+          echo "Using $MVK_A"
+          echo "MVK_STATIC=$MVK_A" >> "$GITHUB_ENV"
+
+      - name: Configure (cmake --preset ios-vulkan)
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake --preset ios-vulkan \
+            -DVulkan_LIBRARY="$MVK_STATIC" \
+            -DVulkan_MoltenVK_LIBRARY="$MVK_STATIC"
+
+      - name: Build engine (z_generals)
+        run: |
+          set -o pipefail
+          cmake --build build/ios-vulkan --target z_generals -j "$(sysctl -n hw.ncpu)" 2>&1 | tee build-ios.log
+
+      - name: Package unsigned .ipa
+        run: |
+          set -euo pipefail
+          ROOT="$PWD"
+          BUILD_DIR="$ROOT/build/ios-vulkan"
+          APP_NAME=GeneralsXZH
+          GAME_BIN="$BUILD_DIR/GeneralsMD/GeneralsXZH.app/GeneralsXZH"
+          DXVK_BUILD="$BUILD_DIR/_deps/dxvk-build-macos"
+          [[ -f "$GAME_BIN" ]] || { echo "ERROR: engine binary missing at $GAME_BIN"; find "$BUILD_DIR" -name GeneralsXZH -type f | head; exit 1; }
+
+          # 1. Shell app (Info.plist, icons, launch config) built WITHOUT signing
+          (cd ios && xcodegen generate --quiet)
+          xcodebuild -project ios/$APP_NAME.xcodeproj -scheme $APP_NAME \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath ios/build \
+            PRODUCT_BUNDLE_IDENTIFIER=com.sideload.generalszh \
+            DEVELOPMENT_TEAM="" CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build | tail -5
+          SHELL_APP="ios/build/Build/Products/Release-iphoneos/$APP_NAME.app"
+          [[ -d "$SHELL_APP" ]] || { echo "ERROR: shell app not produced"; exit 1; }
+
+          # 2. Assemble
+          OUT="$ROOT/out"; rm -rf "$OUT"; mkdir -p "$OUT/Payload"
+          APP="$OUT/Payload/$APP_NAME.app"
+          cp -R "$SHELL_APP" "$APP"
+          cp "$GAME_BIN" "$APP/$APP_NAME"
+          mkdir -p "$APP/Frameworks"
+          for lib in \
+            "$DXVK_BUILD/src/d3d8/libdxvk_d3d8.0.dylib" \
+            "$DXVK_BUILD/src/d3d9/libdxvk_d3d9.0.dylib" \
+            "$BUILD_DIR/_deps/sdl3-build/libSDL3.0.dylib" \
+            "$BUILD_DIR/_deps/sdl3_image-build/libSDL3_image.0.dylib" \
+            "$BUILD_DIR/_deps/openal_soft-build/libopenal.1.24.2.dylib"; do
+            [[ -f "$lib" ]] || { echo "ERROR: missing $lib"; exit 1; }
+            cp "$lib" "$APP/Frameworks/"
+          done
+          [[ -f "$BUILD_DIR/libgamespy.dylib" ]] && cp "$BUILD_DIR/libgamespy.dylib" "$APP/Frameworks/" || true
+          mv "$APP/Frameworks/libopenal.1.24.2.dylib" "$APP/Frameworks/libopenal.1.dylib"
+
+          MVK_FW="$HOME/GeneralsX/MoltenVK/MoltenVK/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework"
+          [[ -d "$MVK_FW" ]] || { echo "ERROR: MoltenVK.framework missing"; exit 1; }
+          cp -R "$MVK_FW" "$APP/Frameworks/"
+
+          ICON_SRC="ios/Stub/Assets.xcassets/AppIcon.appiconset/icon.png"
+          if [[ -f "$ICON_SRC" ]]; then
+            sips -z 120 120 "$ICON_SRC" --out "$APP/AppIcon60x60@2x.png" >/dev/null
+            sips -z 152 152 "$ICON_SRC" --out "$APP/AppIcon76x76@2x.png" >/dev/null
+            sips -z 167 167 "$ICON_SRC" --out "$APP/AppIcon83.5x83.5@2x.png" >/dev/null
+          fi
+          install_name_tool -add_rpath "@executable_path/Frameworks" "$APP/$APP_NAME" 2>/dev/null || true
+
+          # 3. Ad-hoc sign (Sideloadly re-signs everything with your Apple ID anyway)
+          for f in "$APP/Frameworks/"*.dylib; do codesign --force -s - "$f"; done
+          codesign --force -s - "$APP/Frameworks/MoltenVK.framework"
+          codesign --force -s - "$APP"
+
+          # 4. Zip into .ipa
+          (cd "$OUT" && zip -qry "$ROOT/GeneralsZH.ipa" Payload)
+          ls -lh "$ROOT/GeneralsZH.ipa"
+
+          # 5. Extras the user copies next to the game files (Documents mode)
+          mkdir -p extras/fonts
+          cp "$HOME/GeneralsX/ios-staging/fonts/"*.ttf extras/fonts/
+          cp ios/config/dxvk.conf extras/
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsZH-ipa
+          path: GeneralsZH.ipa
+          retention-days: 14
+
+      - name: Upload extras (fonts + dxvk.conf)
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsZH-extras
+          path: extras/
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-ios.log
+          if-no-files-found: ignore
