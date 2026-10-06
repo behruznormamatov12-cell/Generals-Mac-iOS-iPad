@@ -48,10 +48,15 @@ jobs:
             command -v "$t" >/dev/null || { echo "MISSING TOOL: $t"; exit 1; }
           done
 
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+      # Full (non-shallow) clone of current vcpkg: vcpkg.json pins ffmpeg 8.1.1,
+      # which older vcpkg snapshots don't know about, and a shallow clone breaks
+      # baseline/override resolution.
+      - name: Setup vcpkg (full clone, latest)
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+          echo "$HOME/vcpkg" >> "$GITHUB_PATH"
 
       - name: Install LunarG Vulkan SDK (with iOS component)
         run: |
